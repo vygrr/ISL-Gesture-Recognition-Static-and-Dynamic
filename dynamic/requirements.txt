@@ -1,0 +1,8 @@
+numpy<2
+mediapipe
+opencv-python==4.11.0.86
+torch
+pandas
+scikit-learn
+tqdm
+

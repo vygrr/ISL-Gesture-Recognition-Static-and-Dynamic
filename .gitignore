@@ -1,0 +1,29 @@
+# --- Python virtual environments ---
+.venv/
+venv/
+
+# --- Ignore only specific debug/accuracy scripts ---
+static/debug.py
+static/accuracy.py
+dynamic/debug_draw.py
+dynamic/debug_frequency.py
+dynamic/debug_metadata.py
+
+# --- Ignore specific debug image ---
+static/debug_landmarks.png
+
+# --- Ignore collage script ---
+static/collage.py
+
+#Ignore data folders
+dynamic/data
+
+# --- General Python cache & IDE files ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
