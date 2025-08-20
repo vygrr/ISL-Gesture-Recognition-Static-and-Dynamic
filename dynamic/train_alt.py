@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-train_alt.py — Alternative sequence models on augmented keypoints.
+train_alt.py — Train alternative sequence models on augmented keypoints.
 
 Models:
   • lstm         : single-layer LSTM → MLP head
   • bilstm_att   : BiLSTM encoder + additive attention pooling → MLP head
-  • relpos       : Transformer with relative position bias
+  • relpos       : Transformer encoder with relative position bias
 
 Data expectation (from augment.py):
   <data_root>/
@@ -13,19 +13,27 @@ Data expectation (from augment.py):
     index_train.csv
     index_val.csv
     index_test.csv (optional)
+    train/<label_id>/*.npz, val/<label_id>/*.npz, ...
 
 Auto save-dir selection:
-  If --save is NOT given and --data is one of:
+  If --save is NOT given and --data points to one of:
     dynamic/data/include_50/aug_keypoints
     dynamic/data/include/aug_keypoints
     dynamic/data/top_<K>/aug_keypoints
-  then outputs go to:
-    .../<subset>/<model_name>      # model_name in {lstm, bilstm_att, relpos}
-Otherwise, pass --save explicitly.
+  outputs go to:
+    dynamic/data/<subset>/<model_name>        # subset in {include_50, include, top_<K>}
+    where model_name ∈ {lstm, bilstm_att, relpos}
+Otherwise pass --save explicitly.
 
-Best model selection:
-  Highest validation macro-F1; ties broken by lower validation loss.
-  Writes: ckpt_best.pt, ckpt_last.pt, log.csv, params.json
+Checkpoints & logs:
+  - ckpt_best.pt    (best by val macro-F1; tie-break by lower val loss)
+  - ckpt_last.pt    (last epoch for resume)
+  - log.csv         (per-epoch metrics)
+  - params.json     (run config)
+
+Robust path resolution:
+  The loader tolerates old absolute paths in index_*.csv (e.g., from another machine).
+  It reconstructs candidates under the current --data root until a match exists.
 """
 
 from __future__ import annotations
@@ -44,83 +52,117 @@ from torch.utils.data import Dataset, DataLoader
 
 # ---------------------- Constants ----------------------
 SEQ_LEN  = 200
-FEAT_DIM = 258
-V_POSE, V_LHAND, V_RHAND = 33, 21, 21
-V_ALL = V_POSE + V_LHAND + V_RHAND  # 75
-
-POSE_L = {
-    "NOSE":0, "LEFT_EYE_INNER":1, "LEFT_EYE":2, "LEFT_EYE_OUTER":3,
-    "RIGHT_EYE_INNER":4, "RIGHT_EYE":5, "RIGHT_EYE_OUTER":6,
-    "LEFT_EAR":7, "RIGHT_EAR":8,
-    "MOUTH_LEFT":9, "MOUTH_RIGHT":10,
-    "LEFT_SHOULDER":11, "RIGHT_SHOULDER":12,
-    "LEFT_ELBOW":13, "RIGHT_ELBOW":14,
-    "LEFT_WRIST":15, "RIGHT_WRIST":16,
-    "LEFT_PINKY":17, "RIGHT_PINKY":18,
-    "LEFT_INDEX":19, "RIGHT_INDEX":20,
-    "LEFT_THUMB":21, "RIGHT_THUMB":22,
-    "LEFT_HIP":23, "RIGHT_HIP":24,
-    "LEFT_KNEE":25, "RIGHT_KNEE":26,
-    "LEFT_ANKLE":27, "RIGHT_ANKLE":28,
-    "LEFT_HEEL":29, "RIGHT_HEEL":30,
-    "LEFT_FOOT_INDEX":31, "RIGHT_FOOT_INDEX":32,
-}
-HAND_EDGES = [
-    (0,1),(1,2),(2,3),(3,4),
-    (0,5),(5,6),(6,7),(7,8),
-    (0,9),(9,10),(10,11),(11,12),
-    (0,13),(13,14),(14,15),(15,16),
-    (0,17),(17,18),(18,19),(19,20)
-]
-POSE_EDGES = [
-    (POSE_L["LEFT_SHOULDER"],  POSE_L["RIGHT_SHOULDER"]),
-    (POSE_L["LEFT_SHOULDER"],  POSE_L["LEFT_ELBOW"]),
-    (POSE_L["LEFT_ELBOW"],     POSE_L["LEFT_WRIST"]),
-    (POSE_L["RIGHT_SHOULDER"], POSE_L["RIGHT_ELBOW"]),
-    (POSE_L["RIGHT_ELBOW"],    POSE_L["RIGHT_WRIST"]),
-    (POSE_L["LEFT_SHOULDER"],  POSE_L["LEFT_HIP"]),
-    (POSE_L["RIGHT_SHOULDER"], POSE_L["RIGHT_HIP"]),
-    (POSE_L["LEFT_HIP"],       POSE_L["RIGHT_HIP"]),
-    (POSE_L["LEFT_HIP"],       POSE_L["LEFT_KNEE"]),
-    (POSE_L["LEFT_KNEE"],      POSE_L["LEFT_ANKLE"]),
-    (POSE_L["RIGHT_HIP"],      POSE_L["RIGHT_KNEE"]),
-    (POSE_L["RIGHT_KNEE"],     POSE_L["RIGHT_ANKLE"]),
-    (POSE_L["NOSE"],           POSE_L["LEFT_SHOULDER"]),
-    (POSE_L["NOSE"],           POSE_L["RIGHT_SHOULDER"]),
-]
-POSE_WRIST_L = POSE_L["LEFT_WRIST"]
-POSE_WRIST_R = POSE_L["RIGHT_WRIST"]
-LHAND_ROOT   = V_POSE + 0
-RHAND_ROOT   = V_POSE + V_LHAND + 0
+FEAT_DIM = 258  # 33*4 (pose) + 21*3 (left hand) + 21*3 (right hand) = 132 + 63 + 63
 
 # ---------------------- IO utils ----------------------
 def safe_mkdir(p: Path): p.mkdir(parents=True, exist_ok=True)
 
 def auto_save_dir(data_root: Path, model_folder: str) -> Optional[Path]:
+    """
+    If data_root ends with .../aug_keypoints and its parent is include_50/include/top_*
+    return dynamic/data/<subset>/<model_folder>, else None.
+    """
     if data_root.name != "aug_keypoints":
         return None
-    subset = data_root.parent.name
+    subset = data_root.parent.name  # include_50 | include | top_<K>
     if subset.startswith("include") or subset.startswith("top_"):
+        # data_root: .../data/<subset>/aug_keypoints
         return data_root.parent.parent / subset / model_folder
     return None
 
+def _infer_split_from_csv(csv_path: Path) -> str:
+    name = csv_path.name.lower()
+    if "train" in name: return "train"
+    if "val"   in name: return "val"
+    if "test"  in name: return "test"
+    return ""
+
+def _parse_from_raw_path(raw: str):
+    """
+    Extract (split, label_dir, filename) hints from a stored path, even if absolute.
+    """
+    p = Path(raw)
+    filename = p.name
+    label_dir = p.parent.name if p.parent.name.isdigit() else ""
+    split_dir = ""
+    if len(p.parents) >= 2:
+        cand = p.parents[1].name.lower()
+        if cand in ("train","val","test"):
+            split_dir = cand
+    return split_dir, label_dir, filename
+
 def load_index(csv_path: Path, base: Path) -> Tuple[List[str], List[int]]:
-    if not csv_path.exists(): return [], []
+    """
+    Robustly resolves npz file paths recorded in index_*.csv, even if those
+    paths were saved on a different machine.
+
+    Strategy per row:
+      1) Use path as-is (absolute) if it exists.
+      2) If relative, resolve under `base`.
+      3) If missing, try `base / filename`.
+      4) If missing, reconstruct as `base / <split>/<label_dir>/<filename>`
+         where <split>, <label_dir> are extracted from the saved path.
+      5) If still missing, reconstruct as `base / <split_from_csv>/<label_from_col>/<filename>`
+         using the CSV being read (train/val/test) and the numeric label_id column
+         (zero-padded to 3 digits, and unpadded fallback).
+      6) Final fallback: `base / <split_from_csv>/<filename>` (rare layouts).
+    """
+    if not csv_path.exists():
+        return [], []
+
     df = pd.read_csv(csv_path)
     need = {"npz_path", "label_id"}
     if not need.issubset(df.columns):
         raise ValueError(f"{csv_path} must contain columns: {need}")
+
+    split_from_csv = _infer_split_from_csv(csv_path)
     paths, labels = [], []
+
     for _, r in df.iterrows():
-        p = Path(str(r["npz_path"]))
-        if not p.is_absolute(): p = base / p
-        if not p.exists():
-            alt = base / p.name
-            if alt.exists(): p = alt
-            else:
-                tqdm.write(f"[WARN] missing sample (skip): {p}")
+        raw = str(r["npz_path"]).strip()
+        label_id = int(r["label_id"])
+        split_from_raw, label_from_raw, filename = _parse_from_raw_path(raw)
+        label_03 = f"{label_id:03d}"
+
+        candidates: List[Path] = []
+
+        p_raw = Path(raw)
+        if p_raw.is_absolute():
+            candidates.append(p_raw)
+
+        candidates.append((base / raw).resolve())      # relative under base
+        candidates.append((base / filename).resolve()) # file directly under base
+
+        if split_from_raw and label_from_raw:
+            candidates.append((base / split_from_raw / label_from_raw / filename).resolve())
+
+        if split_from_csv:
+            candidates.append((base / split_from_csv / label_03 / filename).resolve())
+            candidates.append((base / split_from_csv / str(label_id) / filename).resolve())
+
+        if split_from_raw:
+            candidates.append((base / split_from_raw / label_03 / filename).resolve())
+            candidates.append((base / split_from_raw / str(label_id) / filename).resolve())
+
+        if split_from_csv:
+            candidates.append((base / split_from_csv / filename).resolve())
+
+        chosen = None
+        for c in candidates:
+            try:
+                if c.exists():
+                    chosen = c
+                    break
+            except OSError:
                 continue
-        paths.append(str(p)); labels.append(int(r["label_id"]))
+
+        if chosen is None:
+            tqdm.write(f"[WARN] missing sample (skip): {raw}")
+            continue
+
+        paths.append(str(chosen))
+        labels.append(label_id)
+
     return paths, labels
 
 # ---------------------- Dataset ----------------------
@@ -131,8 +173,9 @@ class NpzSeq(Dataset):
     def __len__(self): return len(self.paths)
     def __getitem__(self, idx):
         with np.load(self.paths[idx]) as z:
-            x = z["x"].astype(np.float32)   # (T,258)
+            x = z["x"].astype(np.float32)     # (T,258)
             y = int(z.get("y", self.labels[idx]))
+        # estimate usable length: last frame that isn't all zeros
         valid = np.any(x != 0, axis=1)
         length = int(valid.nonzero()[0].max()) + 1 if valid.any() else x.shape[0]
         length = max(1, min(int(length), x.shape[0]))
@@ -140,46 +183,10 @@ class NpzSeq(Dataset):
 
 def collate(batch):
     xs, ys, ls = zip(*batch)
-    return (torch.from_numpy(np.stack(xs,0)),
-            torch.tensor(ys, dtype=torch.long),
-            torch.tensor(ls, dtype=torch.long))
-
-# ---------------------- Feature transforms (optional for relpos / RNNs) ----------------------
-def slice_to_joints_xyz(x_258: np.ndarray) -> np.ndarray:
-    T = x_258.shape[0]
-    pose  = x_258[:, :33*4].reshape(T, 33, 4)[..., :3]
-    lhand = x_258[:, 33*4 : 33*4 + 21*3].reshape(T, 21, 3)
-    rhand = x_258[:, 33*4 + 21*3 : ].reshape(T, 21, 3)
-    return np.concatenate([pose, lhand, rhand], axis=1)  # (T,75,3)
-
-def body_center_scale(joints: np.ndarray, eps=1e-6) -> np.ndarray:
-    j = joints.copy()
-    lh, rh = POSE_L["LEFT_HIP"], POSE_L["RIGHT_HIP"]
-    ls, rs = POSE_L["LEFT_SHOULDER"], POSE_L["RIGHT_SHOULDER"]
-    for t in range(j.shape[0]):
-        midhip = 0.5*(j[t, lh] + j[t, rh]); j[t] -= midhip
-        sd = float(np.linalg.norm(j[t, ls, :2] - j[t, rs, :2]))
-        j[t] /= (sd if sd > eps else 1.0)
-    return j
-
-def bone_vectors(joints: np.ndarray) -> np.ndarray:
-    V = V_ALL
-    P = np.full((V,), -1, dtype=np.int32)
-    for a,b in POSE_EDGES:
-        if P[b] == -1 and a != b: P[b] = a
-        elif P[a] == -1 and b != a: P[a] = b
-    for (u,v) in HAND_EDGES:
-        gu, gv = V_POSE+u, V_POSE+v
-        if P[gv] == -1: P[gv] = gu
-    for (u,v) in HAND_EDGES:
-        gu, gv = V_POSE+V_LHAND+u, V_POSE+V_LHAND+v
-        if P[gv] == -1: P[gv] = gu
-    P[LHAND_ROOT] = POSE_WRIST_L; P[RHAND_ROOT] = POSE_WRIST_R
-    bones = np.zeros_like(joints, dtype=np.float32)
-    for v in range(V):
-        p = int(P[v])
-        bones[:, v, :] = joints[:, v, :] - (joints[:, p, :] if p >= 0 else 0.0)
-    return bones
+    X = torch.from_numpy(np.stack(xs, 0))    # (B,T,258)
+    Y = torch.tensor(ys, dtype=torch.long)
+    L = torch.tensor(ls, dtype=torch.long)
+    return X, Y, L
 
 # ---------------------- Models ----------------------
 class LSTMHead(nn.Module):
@@ -193,16 +200,16 @@ class LSTMHead(nn.Module):
         nn.init.xavier_uniform_(self.fc1.weight); nn.init.zeros_(self.fc1.bias)
         nn.init.xavier_uniform_(self.out.weight); nn.init.zeros_(self.out.bias)
     def forward(self, x, lengths):
-        # pack by true lengths
         lengths_cpu = lengths.detach().cpu()
         packed = nn.utils.rnn.pack_padded_sequence(x, lengths_cpu, batch_first=True, enforce_sorted=False)
-        _, (h, _) = self.lstm(packed)
-        h = h[-1]
+        _, (h, _) = self.lstm(packed)          # h: (num_layers, B, H)
+        h = h[-1]                               # (B,H)
         z = torch.tanh(self.fc1(h))
         z = self.drop(z)
         return self.out(z)
 
 class BiLSTMAttn(nn.Module):
+    """BiLSTM + masked additive attention over time."""
     def __init__(self, num_classes, hidden=128, layers=2, dropout=0.3, feat_dim=FEAT_DIM):
         super().__init__()
         self.lstm = nn.LSTM(feat_dim, hidden, num_layers=layers, batch_first=True,
@@ -221,11 +228,12 @@ class BiLSTMAttn(nn.Module):
         H, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)  # (B,T,2H)
         B, Tmax, D = H.shape
         device = H.device
-        mask = (torch.arange(Tmax, device=device)[None, :] < lengths.to(device)[:, None])
+        # mask: True where padded
+        pad_mask = (torch.arange(Tmax, device=device)[None, :] >= lengths.to(device)[:, None])
         scores = self.attn_v(torch.tanh(self.attn_W(H))).squeeze(-1)  # (B,T)
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        scores = scores.masked_fill(pad_mask, torch.finfo(scores.dtype).min)
         alpha = torch.softmax(scores, dim=1)
-        ctx = (alpha.unsqueeze(-1) * H).sum(1)
+        ctx = (alpha.unsqueeze(-1) * H).sum(1)                         # (B,2H)
         z = torch.tanh(self.fc(ctx))
         z = self.drop(z)
         return self.out(z)
@@ -233,6 +241,7 @@ class BiLSTMAttn(nn.Module):
 class RelPosMHA(nn.Module):
     def __init__(self, d_model=256, nhead=8, dropout=0.2, max_len=512):
         super().__init__()
+        assert d_model % nhead == 0
         self.nhead = nhead; self.dk = d_model // nhead; self.max_len = max_len
         self.q = nn.Linear(d_model, d_model); self.k = nn.Linear(d_model, d_model)
         self.v = nn.Linear(d_model, d_model); self.o = nn.Linear(d_model, d_model)
@@ -240,16 +249,18 @@ class RelPosMHA(nn.Module):
         self.rel_bias = nn.Embedding(2*max_len-1, nhead)
     def forward(self, x, key_padding_mask=None):  # x: (B,T,D)
         B, T, D = x.shape
-        q = self.q(x).view(B,T,self.nhead,self.dk).transpose(1,2)
+        q = self.q(x).view(B,T,self.nhead,self.dk).transpose(1,2)  # (B,H,T,dk)
         k = self.k(x).view(B,T,self.nhead,self.dk).transpose(1,2)
         v = self.v(x).view(B,T,self.nhead,self.dk).transpose(1,2)
-        attn = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.dk)
+        attn = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.dk)  # (B,H,T,T)
+        # relative bias
         pos = torch.arange(T, device=x.device)
         rel = torch.clamp(pos[None,:]-pos[:,None] + (self.max_len-1), 0, 2*self.max_len-2)
         bias = self.rel_bias(rel).permute(2,0,1).unsqueeze(0)  # (1,H,T,T)
         attn = attn + bias
+        # key padding mask: True -> mask
         if key_padding_mask is not None:
-            m = key_padding_mask[:,None,None,:].to(torch.bool)
+            m = key_padding_mask[:, None, None, :]  # (B,1,1,T)
             attn = attn.masked_fill(m, float('-inf'))
         w = torch.softmax(attn, dim=-1)
         w = self.drop(w)
@@ -281,7 +292,7 @@ class RelPosTransformer(nn.Module):
         for b in self.blocks:
             x = b(x, key_padding_mask=key_padding_mask)
         x = self.norm(x)
-        x = x.mean(1)
+        x = x.mean(1)   # mean pool over valid tokens (mask handled inside attention)
         return self.fc(x)
 
 # ---------------------- Loss / metrics ----------------------
@@ -294,15 +305,28 @@ class LabelSmoothingCE(nn.Module):
         soft = (1-self.eps)*one + self.eps/n
         return -(soft * logp).sum(1).mean()
 
+def _macro_f1_from_conf(conf: np.ndarray) -> float:
+    C = conf.shape[0]; f1s=[]
+    for c in range(C):
+        tp = conf[c,c]; fp = conf[:,c].sum()-tp; fn = conf[c,:].sum()-tp
+        supp = conf[c,:].sum()
+        if supp == 0: continue
+        prec = tp / (tp+fp) if (tp+fp)>0 else 0.0
+        rec  = tp / (tp+fn) if (tp+fn)>0 else 0.0
+        f1   = (2*prec*rec/(prec+rec)) if (prec+rec)>0 else 0.0
+        f1s.append(f1)
+    return float(np.mean(f1s)) if f1s else 0.0
+
 @torch.no_grad()
-def evaluate(model, loader, device, model_kind: str, use_amp: bool, num_classes: int):
+def evaluate(model, loader, device, model_kind: str, use_amp: bool, num_classes: int, ls_eps: float):
     model.eval()
-    crit = LabelSmoothingCE(0.05)
+    crit = LabelSmoothingCE(ls_eps)
     loss_sum, correct, total = 0.0, 0, 0
     conf = np.zeros((num_classes, num_classes), dtype=np.int64)
     for X, Y, L in loader:
         X, Y, L = X.to(device), Y.to(device), L.to(device)
-        mask = (torch.arange(X.size(1), device=device)[None,:] >= L[:,None])  # PAD mask
+        if model_kind == "relpos":
+            mask = (torch.arange(X.size(1), device=device)[None,:] >= L[:,None])  # PAD mask
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and device.type=="cuda")):
             if model_kind == "lstm":
                 logits = model(X, L)
@@ -314,21 +338,12 @@ def evaluate(model, loader, device, model_kind: str, use_amp: bool, num_classes:
         loss_sum += float(loss.item()) * Y.size(0)
         pred = logits.argmax(1)
         correct += (pred == Y).sum().item()
-        total   += Y.numel()
+        total    += Y.numel()
         for t, p in zip(Y.cpu().numpy(), pred.cpu().numpy()):
-            conf[t, p] += 1
-    # macro-F1
-    f1s=[]
-    for c in range(num_classes):
-        tp = conf[c,c]; fp = conf[:,c].sum()-tp; fn = conf[c,:].sum()-tp
-        supp = conf[c,:].sum()
-        if supp == 0: continue
-        prec = tp / (tp+fp) if (tp+fp)>0 else 0.0
-        rec  = tp / (tp+fn) if (tp+fn)>0 else 0.0
-        f1   = (2*prec*rec/(prec+rec)) if (prec+rec)>0 else 0.0
-        f1s.append(f1)
-    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
-    return {"loss": loss_sum/max(1,total), "acc": correct/max(1,total), "macro_f1": macro_f1}
+            conf[int(t), int(p)] += 1
+    return {"loss": loss_sum/max(1,total),
+            "acc":  correct/max(1,total),
+            "macro_f1": _macro_f1_from_conf(conf)}
 
 def better_by_f1_then_loss(curr, best):
     if best is None: return True
@@ -353,9 +368,9 @@ def main():
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--ls_eps", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--resume", type=str, default="", help="Path to resume, or 'auto'")
+    ap.add_argument("--resume", type=str, default="", help="Path to resume, or 'auto' (looks for ckpt_last.pt)")
 
-    # BiLSTM specifics
+    # LSTM/BiLSTM specifics
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--layers", type=int, default=2)
 
@@ -381,7 +396,6 @@ def main():
             raise SystemExit("Could not auto-select save folder (data not under data/include_*/top_*/aug_keypoints). Please pass --save.")
         save_root = auto
     safe_mkdir(save_root)
-    ckpt_dir = save_root / "ckpts"; safe_mkdir(ckpt_dir)
     last_path = save_root / "ckpt_last.pt"
     best_path = save_root / "ckpt_best.pt"
     log_csv   = save_root / "log.csv"
@@ -403,7 +417,7 @@ def main():
     print(f"[Device] {device.type.upper()}" + (f": {torch.cuda.get_device_name(0)}" if device.type=="cuda" else ""))
 
     if args.model == "lstm":
-        model = LSTMHead(FEAT_DIM, hidden=128, num_classes=num_classes, dropout=args.dropout).to(device)
+        model = LSTMHead(FEAT_DIM, hidden=args.hidden, num_classes=num_classes, dropout=args.dropout).to(device)
     elif args.model == "bilstm_att":
         model = BiLSTMAttn(num_classes=num_classes, hidden=args.hidden, layers=args.layers,
                            dropout=args.dropout, feat_dim=FEAT_DIM).to(device)
@@ -412,7 +426,7 @@ def main():
                                   layers=args.tr_layers, nhead=args.nhead, dropout=args.dropout,
                                   max_len=max(SEQ_LEN,512)).to(device)
 
-    # Optim
+    # Optim & sched
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=(args.amp and device.type=="cuda"))
     except Exception:
@@ -423,7 +437,7 @@ def main():
     # Save params
     params = {
         "model": args.model, "num_classes": num_classes, "epochs": args.epochs, "batch": args.batch,
-        "lr": args.lr, "wd": args.wd, "dropout": args.dropout, "amp": bool(args.amp),
+        "lr": args.lr, "wd": args.wd, "dropout": args.dropout, "amp": bool(args.amp), "ls_eps": float(args.ls_eps),
         "hidden": args.hidden, "layers": args.layers,
         "d_model": args.d_model, "nhead": args.nhead, "tr_layers": args.tr_layers,
         "data_root": str(data_root), "save_root": str(save_root)
@@ -483,7 +497,8 @@ def main():
         sched.step()
 
         # ---- Val ----
-        va = evaluate(model, val_loader, device, args.model, args.amp, num_classes)
+        va = evaluate(model, val_loader, device, args.model, args.amp, num_classes, args.ls_eps)
+
         logs.append({"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc,
                      "val_loss": va["loss"], "val_acc": va["acc"], "val_f1": va["macro_f1"]})
         pd.DataFrame(logs).to_csv(log_csv, index=False)
@@ -493,7 +508,6 @@ def main():
         ck = {"model_state": model.state_dict(), "opt_state": optim.state_dict(),
               "sched_state": sched.state_dict(), "epoch": epoch, "params": params}
         torch.save(ck, last_path)
-        torch.save(ck, ckpt_dir / f"epoch_{epoch:03d}.pt")
         if better_by_f1_then_loss(va, best):
             best = {"macro_f1": va["macro_f1"], "loss": va["loss"]}
             torch.save(ck, best_path)

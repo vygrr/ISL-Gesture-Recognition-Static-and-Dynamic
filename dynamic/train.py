@@ -7,7 +7,7 @@ Data expectation (from augment.py):
     label_to_id.json
     index_train.csv
     index_val.csv
-    index_test.csv     (optional, not required for selection)
+    index_test.csv     (optional)
     train/<label_id>/*.npz, val/<label_id>/*.npz, ...
 
 Auto save-dir selection:
@@ -15,17 +15,15 @@ Auto save-dir selection:
     dynamic/data/include_50/aug_keypoints
     dynamic/data/include/aug_keypoints
     dynamic/data/top_<K>/aug_keypoints
-  then outputs go to the sibling folder:
-    .../<subset>/(ctr_gcn | ctr_gcn_bihand)
-Otherwise, pass --save explicitly.
+  then outputs go to:
+    dynamic/data/<subset>/(ctr_gcn | ctr_gcn_bihand)
+  Otherwise, pass --save explicitly.
 
-Best model selection:
-  Highest validation macro-F1; ties broken by lower validation loss.
-  Saves:
-    ckpt_best.pt    (best by F1→loss)
-    ckpt_last.pt    (last epoch for resume)
-    log.csv         (per-epoch metrics)
-    params.json     (run config)
+Checkpoints & logs:
+  - ckpt_best.pt    (best by val macro-F1; tie-break by lower val loss)
+  - ckpt_last.pt    (last epoch for resume)
+  - log.csv         (per-epoch metrics)
+  - params.json     (run config)
 
 Bi-handed training:
   --bihand            : enable random left/right flip+swap (no canonicalisation)
@@ -129,7 +127,7 @@ def auto_save_dir(data_root: Path, model_folder: str) -> Optional[Path]:
       .../data/include_50/aug_keypoints
       .../data/include/aug_keypoints
       .../data/top_<K>/aug_keypoints
-    return sibling .../<subset>/<model_folder>, else None.
+    return dynamic/data/<subset>/<model_folder>, else None.
     """
     if data_root.name != "aug_keypoints":
         return None
@@ -138,25 +136,99 @@ def auto_save_dir(data_root: Path, model_folder: str) -> Optional[Path]:
         return data_root.parent.parent / subset / model_folder
     return None
 
+def _infer_split_from_csv(csv_path: Path) -> str:
+    name = csv_path.name.lower()
+    if "train" in name: return "train"
+    if "val"   in name: return "val"
+    if "test"  in name: return "test"
+    return ""
+
+def _parse_from_raw_path(raw: str):
+    """
+    Extract (split, label_dir, filename) hints from a stored path, even if absolute.
+    """
+    p = Path(raw)
+    filename = p.name
+    label_dir = p.parent.name if p.parent.name.isdigit() else ""
+    split_dir = ""
+    if len(p.parents) >= 2:
+        cand = p.parents[1].name.lower()
+        if cand in ("train","val","test"):
+            split_dir = cand
+    return split_dir, label_dir, filename
+
 def load_index(csv_path: Path, base: Path) -> Tuple[List[str], List[int]]:
+    """
+    Robustly resolves npz file paths recorded in index_*.csv, even if those
+    paths were saved on a different machine.
+
+    Strategy per row:
+      1) Use path as-is (absolute) if it exists.
+      2) If relative, resolve under `base`.
+      3) If missing, try `base / filename`.
+      4) If missing, reconstruct as `base / <split>/<label_dir>/<filename>`
+         where <split>, <label_dir> are extracted from the saved path.
+      5) If still missing, reconstruct as `base / <split_from_csv>/<label_from_col>/<filename>`
+         using the CSV being read (train/val/test) and the numeric label_id column
+         (zero-padded to 3 digits, and unpadded fallback).
+      6) Final fallback: `base / <split_from_csv>/<filename>` (rare layouts).
+    """
     if not csv_path.exists():
         return [], []
+
     df = pd.read_csv(csv_path)
     need = {"npz_path", "label_id"}
     if not need.issubset(df.columns):
         raise ValueError(f"{csv_path} must contain columns: {need}")
+
+    split_from_csv = _infer_split_from_csv(csv_path)
     paths, labels = [], []
+
     for _, r in df.iterrows():
-        p = Path(str(r["npz_path"]))
-        if not p.is_absolute():
-            p = base / p
-        if not p.exists():
-            alt = base / p.name
-            if alt.exists(): p = alt
-            else:
-                tqdm.write(f"[WARN] missing sample (skip): {p}")
+        raw = str(r["npz_path"]).strip()
+        label_id = int(r["label_id"])
+        split_from_raw, label_from_raw, filename = _parse_from_raw_path(raw)
+        label_03 = f"{label_id:03d}"
+
+        candidates: List[Path] = []
+
+        p_raw = Path(raw)
+        if p_raw.is_absolute():
+            candidates.append(p_raw)
+
+        candidates.append((base / raw).resolve())      # relative under base
+        candidates.append((base / filename).resolve()) # file directly under base
+
+        if split_from_raw and label_from_raw:
+            candidates.append((base / split_from_raw / label_from_raw / filename).resolve())
+
+        if split_from_csv:
+            candidates.append((base / split_from_csv / label_03 / filename).resolve())
+            candidates.append((base / split_from_csv / str(label_id) / filename).resolve())
+
+        if split_from_raw:
+            candidates.append((base / split_from_raw / label_03 / filename).resolve())
+            candidates.append((base / split_from_raw / str(label_id) / filename).resolve())
+
+        if split_from_csv:
+            candidates.append((base / split_from_csv / filename).resolve())
+
+        chosen = None
+        for c in candidates:
+            try:
+                if c.exists():
+                    chosen = c
+                    break
+            except OSError:
                 continue
-        paths.append(str(p)); labels.append(int(r["label_id"]))
+
+        if chosen is None:
+            tqdm.write(f"[WARN] missing sample (skip): {raw}")
+            continue
+
+        paths.append(str(chosen))
+        labels.append(label_id)
+
     return paths, labels
 
 # ---------------------- Dataset ----------------------
@@ -202,16 +274,20 @@ def body_center_scale(joints: np.ndarray, eps=1e-6) -> np.ndarray:
 def bone_vectors(joints: np.ndarray) -> np.ndarray:
     V = V_ALL
     P = np.full((V,), -1, dtype=np.int32)
+    # pose parents
     for a,b in POSE_EDGES:
         if P[b] == -1 and a != b: P[b] = a
-        elif P[a] == -1 and b != a: P[a] = b
+        if P[a] == -1 and b != a: P[a] = b
+    # left hand parents (relative to left wrist root)
     for (u,v) in HAND_EDGES:
         gu, gv = V_POSE+u, V_POSE+v
         if P[gv] == -1: P[gv] = gu
+    # right hand parents (relative to right wrist root)
     for (u,v) in HAND_EDGES:
         gu, gv = V_POSE+V_LHAND+u, V_POSE+V_LHAND+v
         if P[gv] == -1: P[gv] = gu
-    P[LHAND_ROOT] = POSE_WRIST_L; P[RHAND_ROOT] = POSE_WRIST_R
+    P[LHAND_ROOT] = POSE_WRIST_L
+    P[RHAND_ROOT] = POSE_WRIST_R
     bones = np.zeros_like(joints, dtype=np.float32)
     for v in range(V):
         p = int(P[v])
@@ -244,6 +320,7 @@ class CTRGCNBlock(nn.Module):
         for (u,v) in HAND_EDGES:
             gu, gv = V_POSE+u, V_POSE+v; A[gu,gv]=A[gv,gu]=1
             gu, gv = V_POSE+V_LHAND+u, V_POSE+V_LHAND+v; A[gu,gv]=A[gv,gu]=1
+        # connect wrists to hand roots
         A[POSE_WRIST_L, LHAND_ROOT] = A[LHAND_ROOT, POSE_WRIST_L] = 1
         A[POSE_WRIST_R, RHAND_ROOT] = A[RHAND_ROOT, POSE_WRIST_R] = 1
         D = np.sum(A, 1, keepdims=True) + 1e-6
@@ -442,7 +519,7 @@ def main():
 
     # Repro
     random.seed(args.seed); np.random.seed(args.seed)
-    torch.manual_seed(args.seed); 
+    torch.manual_seed(args.seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
 
     data_root = Path(args.data).resolve()
@@ -456,7 +533,6 @@ def main():
             raise SystemExit("Could not auto-select save folder (data not under data/include_*/top_*/aug_keypoints). Please pass --save.")
         save_root = auto
     safe_mkdir(save_root)
-    ckpt_dir = save_root / "ckpts"; safe_mkdir(ckpt_dir)
     last_path = save_root / "ckpt_last.pt"
     best_path = save_root / "ckpt_best.pt"
     log_csv   = save_root / "log.csv"
@@ -607,7 +683,6 @@ def main():
         ck = {"model_state": model.state_dict(), "opt_state": optim.state_dict(),
               "sched_state": sched.state_dict(), "epoch": epoch, "params": params}
         torch.save(ck, last_path)
-        torch.save(ck, ckpt_dir / f"epoch_{epoch:03d}.pt")
 
         # Save best (macro-F1 then loss)
         if better_by_f1_then_loss(va, best):
