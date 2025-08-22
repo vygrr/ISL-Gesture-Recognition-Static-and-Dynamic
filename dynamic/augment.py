@@ -1,13 +1,22 @@
-# augment.py — INCLUDE dynamic: splits → augmentation → keypoints (hands+pose)
-# - GitHub-friendly defaults: reads split CSVs from ./data and auto-picks output:
-#     include50 → ./data/include_50/aug_keypoints
-#     all       → ./data/include/aug_keypoints
-#     topk      → ./data/top_<K>/aug_keypoints  (K = --top_k, default 100; e.g., ./data/top_100/aug_keypoints)
-# - Mirrors your original heuristics:
-#     1) Torso crop: full width, cut slightly below hip line (hip-based, EMA-stabilized).
-#     2) Gentle idle-trim: keep largest active/present block with padding (train only, opt-in).
-# - Saves: label_to_id.json, index_{train,val,test}.csv, and {split}/{label_id}/*.npz (x:(200,258) float16, y:int16).
-# - Top-K mode: defaults ranking CSV to ./data/real_world_ranking.csv; override via --ranking_csv.
+#!/usr/bin/env python3
+"""
+augment.py — INCLUDE dynamic: splits → augmentation → keypoints (hands+pose) with RESUME support
+
+What’s new (resume-safe + GitHub-friendly):
+  • Auto-selects default output dir from --subset:
+      include50 → ./data/include_50/aug_keypoints
+      all       → ./data/include/aug_keypoints
+      topk      → ./data/top_<K>/aug_keypoints  (K = --top_k, e.g., ./data/top_100/aug_keypoints)
+  • Mirrors your original heuristics:
+      1) Torso crop: full width, cut slightly below hip line (hip-based, EMA-stabilized).
+      2) Gentle idle-trim: keep largest active/present block with padding (train only, opt-in).
+  • Saves: label_to_id.json, index_{train,val,test}.csv and {split}/{label_id}/*.npz  (x:(200,258) float16, y:int16).
+  • Top-K mode: defaults ranking CSV to ./data/real_world_ranking.csv; override via --ranking_csv.
+  • NEW: Resume/overwrite/verify controls:
+      --resume (default) skips already-existing .npz (fast), can also update only their 'y' if label ids changed.
+      --force  recomputes everything even if target .npz exists.
+      --verify validates existing files (shape/dtype) and repairs wrong label ids without re-extraction.
+"""
 
 from __future__ import annotations
 import argparse
@@ -248,7 +257,6 @@ def gentle_trim_vecs(vecs: np.ndarray,
         act_s[i] = prev
 
     # Binary score: high when activity or hands are present
-    # Threshold at quantile q of non-zero activity
     nz = act_s[act_s > 0]
     thr = (np.quantile(nz, q) if nz.size > 0 else 0.0)
     score = ((act_s >= thr) | (prs > 0.10)).astype(np.uint8)
@@ -423,6 +431,30 @@ def build_tasks_for_split(
             })
     return tasks
 
+def _verify_npz_and_fix_label(npz_path: Path, expect_label_id: int, verify_shape=True) -> Tuple[bool, bool]:
+    """
+    Returns (valid, updated_label):
+      valid          → file exists and (optionally) has correct shape/dtype.
+      updated_label  → we changed the stored 'y' to match expect_label_id.
+    """
+    if not npz_path.exists():
+        return False, False
+    updated = False
+    try:
+        with np.load(npz_path) as z:
+            x = z["x"]
+            y = int(z.get("y", expect_label_id))
+        ok_shape = (not verify_shape) or (isinstance(x, np.ndarray) and x.shape == (SEQ_LEN, 258) and x.dtype == DTYPE)
+        if not ok_shape:
+            return False, False
+        if y != expect_label_id:
+            # Update only the label without recomputing features
+            np.savez_compressed(npz_path, x=x.astype(DTYPE, copy=False), y=np.int16(expect_label_id))
+            updated = True
+        return True, updated
+    except Exception:
+        return False, False
+
 def worker_run(task: dict) -> dict:
     """Run one task in a worker process. Returns a small dict describing success or error."""
     try:
@@ -461,39 +493,71 @@ def process_split_parallel(
     trim_idle_flag: bool,
     torso_frac: float,
     torso_px: int,
+    resume: bool,
+    force: bool,
+    verify_existing: bool,
 ):
     tasks = build_tasks_for_split(split, df, root, out_root, label_to_id, left, right, top, torso, trim_idle_flag, torso_frac, torso_px)
     total = len(tasks)
     print(f"[{split}] videos: {len(df)} | tasks (video×crop): {total} | workers: {workers}")
 
-    index_rows = []
+    index_rows: List[dict] = []
     errors = 0
+    skipped_exist = 0
+    fixed_labels = 0
 
     if total == 0:
         print(f"[{split}] No tasks to run.")
         pd.DataFrame(index_rows).to_csv(out_root / f"index_{split}.csv", index=False)
         return
 
-    with mp.get_context("spawn").Pool(processes=workers, initializer=init_worker) as pool:
-        for res in tqdm(pool.imap_unordered(worker_run, tasks, chunksize=chunksize),
-                        total=total, desc=f"{split}: tasks", unit="task"):
-            if res.get("ok"):
+    # Pre-filter tasks for resume/force
+    tasks_to_run: List[dict] = []
+    if resume and not force:
+        for t in tasks:
+            p = Path(t["out_path"])
+            valid, updated = _verify_npz_and_fix_label(p, t["label_id"], verify_shape=verify_existing)
+            if valid:
+                skipped_exist += 1
+                if updated:
+                    fixed_labels += 1
+                # Rebuild index row from task (ensures consistent columns even if old index is missing)
                 index_rows.append({
-                    "npz_path": res["npz_path"],
-                    "label": res["label"],
-                    "label_id": res["label_id"],
-                    "video_path": res["video_path"],
-                    "crop_kind": res["crop_kind"],
+                    "npz_path": str(p),
+                    "label": t["label"],
+                    "label_id": t["label_id"],
+                    "video_path": t["video_rel"],
+                    "crop_kind": t["crop_kind"],
                 })
             else:
-                errors += 1
-                t = res.get("task", {})
-                tqdm.write(f"[ERR] {split} | {t.get('video_rel')} | {t.get('crop_kind')}: {res.get('error')}")
+                tasks_to_run.append(t)
+        print(f"[{split}] resume: found {skipped_exist} existing .npz (fixed labels: {fixed_labels}); remaining to run: {len(tasks_to_run)}")
+    else:
+        # force: run all tasks; resume disabled: run all tasks
+        tasks_to_run = tasks
 
+    if len(tasks_to_run) > 0:
+        with mp.get_context("spawn").Pool(processes=workers, initializer=init_worker) as pool:
+            for res in tqdm(pool.imap_unordered(worker_run, tasks_to_run, chunksize=chunksize),
+                            total=len(tasks_to_run), desc=f"{split}: tasks", unit="task"):
+                if res.get("ok"):
+                    index_rows.append({
+                        "npz_path": res["npz_path"],
+                        "label": res["label"],
+                        "label_id": res["label_id"],
+                        "video_path": res["video_path"],
+                        "crop_kind": res["crop_kind"],
+                    })
+                else:
+                    errors += 1
+                    t = res.get("task", {})
+                    tqdm.write(f"[ERR] {split} | {t.get('video_rel')} | {t.get('crop_kind')}: {res.get('error')}")
+
+    # Write index
     idx_df = pd.DataFrame(index_rows)
     idx_path = out_root / f"index_{split}.csv"
     idx_df.to_csv(idx_path, index=False)
-    print(f"[{split}] wrote {len(idx_df)} items → {idx_path} | errors: {errors}")
+    print(f"[{split}] wrote {len(idx_df)} items → {idx_path} | errors: {errors} | skipped_exist: {skipped_exist} | fixed_labels: {fixed_labels}")
 
 # ---------------------- Defaults & main ----------------------
 def default_out_dir(subset: str, top_k: int) -> Path:
@@ -542,6 +606,14 @@ def main():
     ap.add_argument("--torso_px", type=int, default=10, help="Abdomen cut offset (pixels)")
     # Faulty-filter toggle
     ap.add_argument("--no_faulty_filter", action="store_true", help="Disable filtering of known faulty videos")
+    # Resume / overwrite / verify
+    ap.add_argument("--resume", action="store_true", default=True,
+                    help="Resume: skip existing .npz (and fix stored labels if needed). (default: True)")
+    ap.add_argument("--no-resume", dest="resume", action="store_false",
+                    help="Disable resume: do not skip existing files.")
+    ap.add_argument("--force", action="store_true", help="Overwrite and recompute even if .npz exists.")
+    ap.add_argument("--verify", action="store_true",
+                    help="When resuming, validate shape/dtype of existing .npz; re-extract if invalid.")
     # Runtime
     ap.add_argument("--workers", type=int, default=1, help="Parallel worker processes")
     ap.add_argument("--chunksize", type=int, default=2, help="Pool.imap_unordered chunksize")
@@ -604,19 +676,22 @@ def main():
     process_split_parallel("train", train_df, root, out_root, label_to_id,
                            left=max(0, args.left), right=max(0, args.right), top=max(0, args.top), torso=max(0, args.torso),
                            workers=max(1, args.workers), chunksize=max(1, args.chunksize),
-                           trim_idle_flag=bool(args.trim_idle), torso_frac=float(args.torso_frac), torso_px=int(args.torso_px))
+                           trim_idle_flag=bool(args.trim_idle), torso_frac=float(args.torso_frac), torso_px=int(args.torso_px),
+                           resume=bool(args.resume), force=bool(args.force), verify_existing=bool(args.verify))
 
     print("\n=== START: VAL ===")
     process_split_parallel("val", val_df, root, out_root, label_to_id,
                            left=0, right=0, top=0, torso=0,
                            workers=max(1, args.workers), chunksize=max(1, args.chunksize),
-                           trim_idle_flag=False, torso_frac=float(args.torso_frac), torso_px=int(args.torso_px))
+                           trim_idle_flag=False, torso_frac=float(args.torso_frac), torso_px=int(args.torso_px),
+                           resume=bool(args.resume), force=bool(args.force), verify_existing=bool(args.verify))
 
     print("\n=== START: TEST ===")
     process_split_parallel("test", test_df, root, out_root, label_to_id,
                            left=0, right=0, top=0, torso=0,
                            workers=max(1, args.workers), chunksize=max(1, args.chunksize),
-                           trim_idle_flag=False, torso_frac=float(args.torso_frac), torso_px=int(args.torso_px))
+                           trim_idle_flag=False, torso_frac=float(args.torso_frac), torso_px=int(args.torso_px),
+                           resume=bool(args.resume), force=bool(args.force), verify_existing=bool(args.verify))
 
     print("\n[DONE] All splits processed.")
 
