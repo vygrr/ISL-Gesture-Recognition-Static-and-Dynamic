@@ -1,6 +1,5 @@
 # --- Python virtual environments ---
 .venv/
-venv/
 
 # --- Ignore only specific debug/accuracy scripts ---
 static/debug.py
@@ -17,13 +16,3 @@ static/collage.py
 
 #Ignore data folders
 dynamic/data
-
-# --- General Python cache & IDE files ---
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.ipynb_checkpoints/
-.idea/
-.vscode/
-.DS_Store
