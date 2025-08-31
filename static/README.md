@@ -1,6 +1,13 @@
 # Static Module (Alphabets & Numerals) — MLP over 126‑D Hands
 
-This module performs **frame‑level** classification for alphabets and numerals using MediaPipe Hands landmarks.
+Frame‑level classification for alphabets and numerals using MediaPipe Hands landmarks.
+
+---
+
+## Install
+```bash
+pip install -r static/requirements.txt
+```
 
 ---
 
@@ -26,7 +33,7 @@ python static/train.py
 #   static/data/encoder/{alphabets.pkl,numerals.pkl}
 ```
 
-Use `accuracy.py` to quickly verify test accuracy and a classification report.
+Use `accuracy.py` for a quick test accuracy & classification report.
 
 ---
 
@@ -37,5 +44,5 @@ python static/inference.py
 ```
 
 **Notes**
-- Some alphabets are single‑hand only (e.g., C, I, L, O, U, V); numerals require one hand.
-- The training script applies horizontal‑flip augmentation so either hand can be recognized.
+- Some alphabets are single‑hand only (e.g., C, I, L, O, U, V); numerals use one hand.
+- Training applies horizontal‑flip augmentation so either hand can be recognized.
