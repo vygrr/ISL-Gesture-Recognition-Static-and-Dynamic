@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# root_inference.py — Unified ISL inference (Static MLP + Dynamic CTR-GCN)
-# Sentence formation & fingerspelling correction via Gemini (gemini_client.py)
-# - No SymSpell
-# - No TTS
-# - Fast UI: auto/manual windowing, idle/active, pre/post frames, flip, bold HUD, wrapping
+# root_inference.py — Unified ISL realtime inference (Static MLP + Dynamic CTR-GCN)
+# Sentence formation via Gemini (gemini_client.py). No SymSpell/TTS here.
+# - Static: MLP + LabelEncoder (exactly like static/inference.py)
+# - Dynamic: CTR-GCN, params from params.json/ckpt, id→label sorted by ID
+# - UI: auto/manual windows, idle/active, pre/post frames, flip, bold & wrapping text
+# - Static letters are buffered; Space commits a spelled word; dynamic words are whole tokens
 
 from __future__ import annotations
-import argparse, json, math, os, re, sys, time
+import argparse, json, math, os, re, time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,7 +24,8 @@ except Exception as e:
     raise SystemExit("MediaPipe required (pip install mediapipe>=0.10): " + str(e))
 
 # ---------- Gemini ----------
-from gemini_client import GeminiFormatter, GeminiNotAvailable, GeminiBadResponse
+# Expect gemini_client.py to define GeminiFormatter(model_name, api_key, temperature)
+from gemini_client import GeminiFormatter
 
 
 # ======================= Static (MLP) =======================
@@ -49,13 +51,13 @@ class StaticPredictor:
         self.encoder = joblib.load(str(enc))
         classes = getattr(self.encoder, 'classes_', None)
         if classes is None: raise RuntimeError(f"Encoder at {enc} has no classes_.")
-        self.model = MLP(input_dim=126, num_classes=len(classes)).to(device)
+        self.model = MLP(input_dim=126, num_classes=len(classes)).to(device).eval()
         state = torch.load(pth, map_location=device)
         if isinstance(state, dict) and 'state_dict' in state: state = state['state_dict']
-        self.model.load_state_dict(state); self.model.eval()
+        self.model.load_state_dict(state)
         self.device = device
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_probs(self, X: np.ndarray) -> np.ndarray:
         x = torch.from_numpy(X.astype(np.float32)).to(self.device)
         logits = self.model(x)
@@ -67,9 +69,16 @@ class StaticPredictor:
 
 # ======================= Dynamic (CTR-GCN) =======================
 SEQ_LEN, FEAT_DIM, DTYPE = 200, 258, np.float32
-# Pose landmark indices (subset we need frequently)
-POSE_L={ "NOSE":0,"LEFT_SHOULDER":11,"RIGHT_SHOULDER":12,"LEFT_ELBOW":13,"RIGHT_ELBOW":14,"LEFT_WRIST":15,"RIGHT_WRIST":16,"LEFT_HIP":23,"RIGHT_HIP":24 }
 V_POSE,V_LHAND,V_RHAND=33,21,21; V_ALL=75
+
+POSE_L={ "NOSE":0,"LEFT_SHOULDER":11,"RIGHT_SHOULDER":12,"LEFT_ELBOW":13,"RIGHT_ELBOW":14,
+         "LEFT_WRIST":15,"RIGHT_WRIST":16,"LEFT_HIP":23,"RIGHT_HIP":24 }
+
+HAND_EDGES=[(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(0,9),(9,10),(10,11),(11,12),
+            (0,13),(13,14),(14,15),(15,16),(0,17),(17,18),(18,19),(19,20)]
+POSE_EDGES=[(11,12),(11,13),(13,15),(12,14),(14,16),(11,23),(12,24),(23,24),(0,11),(0,12)]
+POSE_WRIST_L=POSE_L["LEFT_WRIST"]; POSE_WRIST_R=POSE_L["RIGHT_WRIST"]
+LHAND_ROOT=V_POSE+0; RHAND_ROOT=V_POSE+V_LHAND+0
 
 def extract_258_from_holistic(frame_bgr, holistic)->np.ndarray:
     rgb=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB); rgb.flags.writeable=False
@@ -104,21 +113,16 @@ def body_center_scale(j: np.ndarray, eps=1e-6)->np.ndarray:
 
 def bone_vectors(j: np.ndarray)->np.ndarray:
     V=V_ALL; P=np.full((V,),-1,np.int32)
-    # Simple kinematic tree (pose)
-    for (a,b) in [(11,12),(11,13),(13,15),(12,14),(14,16),(11,23),(12,24),(23,24),(0,11),(0,12)]:
+    for (a,b) in POSE_EDGES:
         if P[b]==-1: P[b]=a
         if P[a]==-1: P[a]=b
-    # Left hand chain
-    for (u,v) in [(0,5),(5,6),(6,7),(7,8),(0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),(0,17),(17,18),(18,19),(19,20)]:
-        gu,gv=33+u,33+v
+    for (u,v) in HAND_EDGES:
+        gu,gv=V_POSE+u, V_POSE+v
         if P[gv]==-1: P[gv]=gu
-    # Right hand chain
-    base=33+21
-    for (u,v) in [(0,5),(5,6),(6,7),(7,8),(0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),(0,17),(17,18),(18,19),(19,20)]:
-        gu,gv=base+u,base+v
+    for (u,v) in HAND_EDGES:
+        gu,gv=V_POSE+V_LHAND+u, V_POSE+V_LHAND+v
         if P[gv]==-1: P[gv]=gu
-    # bridge wrists
-    P[33+0]=15; P[33+21+0]=16
+    P[LHAND_ROOT]=POSE_WRIST_L; P[RHAND_ROOT]=POSE_WRIST_R
     bones=np.zeros_like(j)
     for v in range(V):
         p=int(P[v]); bones[:,v,:]=j[:,v,:]-(j[:,p,:] if p>=0 else 0.0)
@@ -129,16 +133,12 @@ class CTRGCNBlock(nn.Module):
         super().__init__()
         self.theta=nn.Conv2d(C_in,C_out//4,1); self.phi=nn.Conv2d(C_in,C_out//4,1); self.g=nn.Conv2d(C_in,C_out,1)
         A=np.eye(V,dtype=np.float32)
-        # pose links
-        for (a,b) in [(11,12),(11,13),(13,15),(12,14),(14,16),(11,23),(12,24),(23,24),(0,11),(0,12)]:
-            A[a,b]=A[b,a]=1
-        # hands dense-ish
-        def hand_edges(off):
-            E=[(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
-               (0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),(0,17),(17,18),(18,19),(19,20)]
-            for u,v in E: A[off+u,off+v]=A[off+v,off+u]=1
-        hand_edges(33); hand_edges(33+21)
-        A[15,33+0]=A[33+0,15]=1; A[16,33+21+0]=A[33+21+0,16]=1
+        for (a,b) in POSE_EDGES: A[a,b]=A[b,a]=1
+        for (u,v) in HAND_EDGES:
+            gu,gv=V_POSE+u, V_POSE+v; A[gu,gv]=A[gv,gu]=1
+            gu,gv=V_POSE+V_LHAND+u, V_POSE+V_LHAND+v; A[gu,gv]=A[gv,gu]=1
+        A[POSE_WRIST_L, LHAND_ROOT]=A[LHAND_ROOT,POSE_WRIST_L]=1
+        A[POSE_WRIST_R, RHAND_ROOT]=A[RHAND_ROOT,POSE_WRIST_R]=1
         D=np.sum(A,1,keepdims=True)+1e-6; A=A/np.sqrt(D@D.T)
         self.register_buffer("A_base",torch.from_numpy(A).float())
         self.A_learn=nn.Parameter(torch.zeros_like(self.A_base)); nn.init.uniform_(self.A_learn,-0.01,0.01)
@@ -181,18 +181,40 @@ def load_params_from_ckpt_and_sidecar(ckpt_path: Path)->Dict:
     if not params: raise SystemExit("Could not find run params.")
     return params
 
+def _norm_model_name(n:str)->str:
+    n=(n or "").lower().strip()
+    return {"ctr-gcn":"ctr_gcn","ctr_gcn_bihand":"ctr_gcn"}.get(n,n)
+
+def build_model_from_params(num_classes:int, params:Dict):
+    mn=_norm_model_name(params.get("model","ctr_gcn"))
+    if mn!="ctr_gcn": raise SystemExit(f"Root expects CTR-GCN; got {mn}")
+    c_in=3 + (3 if params.get("use_bones",False) else 0) + (3 if params.get("use_vel",False) else 0)
+    channels=tuple(params.get("channels",(64,128,256)))
+    blocks  =tuple(params.get("blocks",(2,2,2)))
+    kernel_t=int(params.get("kernel_t",9)); dropout=float(params.get("dropout", params.get("drop_out",0.3)))
+    return CTRGCN(num_classes,c_in=c_in,channels=channels,blocks=blocks,kernel_t=kernel_t,dropout=dropout)
+
 def clean_dyn_label(lbl: str)->str:
     s = re.sub(r"^\s*\d+\.\s*", "", lbl)      # remove leading "NN. "
     s = re.sub(r"\s*\([^)]*\)", "", s)        # remove parentheses
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
-def build_model_from_params(num_classes:int, params:Dict):
-    model_name=(params.get("model","ctr_gcn") or "ctr_gcn").lower()
-    if model_name!="ctr_gcn": raise SystemExit("Root expects CTR-GCN for dynamic.")
-    c_in=3 + (3 if params.get("use_bones",False) else 0) + (3 if params.get("use_vel",False) else 0)
-    return CTRGCN(num_classes,c_in=c_in,channels=(64,128,256),blocks=(2,2,2),
-                  kernel_t=int(params.get("kernel_t",9)),dropout=float(params.get("dropout",0.3)))
+def build_id_to_label_sorted(aug_root: Path)->List[str]:
+    j=aug_root/"label_to_id.json"
+    if not j.exists(): raise FileNotFoundError(f"{j} not found")
+    m=json.loads(j.read_text(encoding="utf-8"))
+    pairs=[]
+    for k,v in m.items():
+        try: idx=int(v)
+        except: idx=int(str(v).strip())
+        pairs.append((idx, k))
+    pairs.sort(key=lambda x:x[0])
+    max_id=pairs[-1][0]
+    id2=[None]*(max_id+1)
+    for idx,lbl in pairs: id2[idx]=clean_dyn_label(lbl)   # cleaned for display/tokens
+    print(f"[Dynamic labels] total={len(id2)} | head={id2[:8]}")
+    return id2
 
 def slice_to_inputs_ctr(seq_258: np.ndarray, valid_len:int, params:Dict, device, half:bool):
     j=slice_to_joints_xyz(seq_258)
@@ -234,7 +256,7 @@ def impute_short_gaps(seq: np.ndarray, max_gap:int=5)->np.ndarray:
 
 @dataclass
 class DynPredictor:
-    id_to_label: Dict[int,str]; model: Any; device: torch.device; params: Dict[str,Any]; use_half: bool=False
+    id_to_label: List[str]; model: Any; device: torch.device; params: Dict[str,Any]; use_half: bool=False
     @torch.inference_mode()
     def predict(self, seq_258: np.ndarray, seq_len:int)->Tuple[str,float]:
         L=min(seq_258.shape[0], seq_len); x=seq_258[:L].astype(np.float32); x=impute_short_gaps(x,5)
@@ -245,30 +267,25 @@ class DynPredictor:
         return self.id_to_label[top], float(prob[top].item())
 
 def build_dynamic(aug_root: Path, ctr_dir: Path, force_cpu:bool=False, use_half:bool=False)->DynPredictor:
-    label_json=aug_root/"label_to_id.json"
-    if not label_json.exists(): raise FileNotFoundError(f"{label_json} not found")
-    label_to_id_raw=json.loads(label_json.read_text(encoding="utf-8"))
-    id_to_label={int(v): clean_dyn_label(k) for k,v in label_to_id_raw.items()}
-
+    id_to_label=build_id_to_label_sorted(aug_root)
     ckpt=ctr_dir/"ckpt_best.pt"
     if not ckpt.exists():
         cands=list(ctr_dir.rglob("ckpt_best.pt"))
         if not cands: raise FileNotFoundError(f"ckpt_best.pt not found under {ctr_dir}")
         ckpt=cands[0]
     params=load_params_from_ckpt_and_sidecar(ckpt)
-
     device=torch.device("cpu" if (force_cpu or not torch.cuda.is_available()) else "cuda")
     if device.type=='cuda': torch.backends.cudnn.benchmark=True
     print(f"[Dynamic device] {device}")
-
     model=build_model_from_params(num_classes=len(id_to_label), params=params).to(device).eval()
     sd=torch.load(ckpt,map_location=device)
     sd = sd.get("model_state", sd.get("state_dict", sd))
-    model.load_state_dict(sd, strict=False)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        print(f"[Dynamic load] missing={len(missing)} unexpected={len(unexpected)}")
     if use_half and device.type=='cuda':
         try: model=model.half()
         except: pass
-
     return DynPredictor(id_to_label=id_to_label, model=model, device=device, params=params, use_half=(use_half and device.type=='cuda'))
 
 
@@ -357,7 +374,7 @@ def draw_wrapped_tokens(img, tokens: List[str], origin: Tuple[int,int], max_widt
         (w,h),_=cv2.getTextSize(tok,FONT,scale,thickness)
         if x+w > x0+max_width:
             x=x0; y+=h+line_gap
-        # "bold": draw twice
+        # Bold: draw twice
         cv2.putText(img, tok, (x,y), FONT, scale, color, thickness, cv2.LINE_AA)
         cv2.putText(img, tok, (x,y), FONT, scale, color, thickness, cv2.LINE_AA)
         x+=w+space_w
@@ -418,11 +435,12 @@ class App:
         # Gemini
         self.use_gemini = bool(args.use_gemini)
         if self.use_gemini:
-            key = args.gemini_key if args.gemini_key else None
+            key = args.gemini_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
             try:
                 self.gemini = GeminiFormatter(model_name=args.gemini_model, api_key=key, temperature=args.temperature)
+                print(f"[Gemini] Using model={args.gemini_model}")
             except Exception as e:
-                print(f"[Gemini] Disabled ({e}). Falling back to local minimal formatter.")
+                print(f"[Gemini] Disabled ({e}).")
                 self.use_gemini=False
 
     def current_static(self)->StaticPredictor:
@@ -435,7 +453,6 @@ class App:
         return label, conf
 
     def _commit_spelling_buffer(self):
-        """Finish the current spelled word: push to tokens, mark spelled index."""
         if self.ctx.spell_buf:
             idx=len(self.ctx.tokens)
             word=self.ctx.spell_buf.strip()
@@ -444,19 +461,14 @@ class App:
             self.ctx.spelled_idxs.add(idx)
             self.ctx.spell_buf=''
 
-    # tiny local fallback if Gemini is off/unavailable
     def _local_minimal_sentence(self, tokens: List[str])->str:
         if not tokens: return ""
         t=[t.strip() for t in tokens if t.strip()]
         if not t: return ""
         subj=t[0]
         cop = "am" if subj.lower()=="i" else ("are" if subj.lower() in ["we","they","you"] else "is")
-        if len(t)>=3 and (t[2][:1].isupper()):
-            sent = f"{subj} {cop} {t[2]}’s {' '.join(t[1:2])}."
-        else:
-            sent = f"{subj} {cop} {' '.join(t[1:])}."
-        sent = sent[0:1].upper() + sent[1:]
-        return sent
+        sent = f"{subj} {cop} {' '.join(t[1:])}."
+        return sent[0:1].upper() + sent[1:]
 
     def _finalize_sentence(self):
         # 1) commit spelling buffer if present
@@ -464,16 +476,8 @@ class App:
         if not self.ctx.tokens:
             self.ctx.final_sentence=""; return
 
-        # 2) clean dynamic labels (numbers/parentheses) for ALL tokens (spelled tokens typically unaffected)
-        cleaned=[]
-        for t in self.ctx.tokens:
-            s = re.sub(r"^\s*\d+\.\s*", "", t)   # strip leading "NN. "
-            s = re.sub(r"\s*\([^)]*\)", "", s)   # remove parentheses
-            s = re.sub(r"\s+", " ", s).strip()
-            cleaned.append(s)
-        tokens = cleaned
-
-        # 3) Form sentence via Gemini with spelled indices; else fallback
+        # 2) Use Gemini (with spelled indices) or fallback
+        tokens=self.ctx.tokens
         if self.use_gemini:
             try:
                 sentence, _ = self.gemini.format_tokens(tokens, spelled_indices=list(self.ctx.spelled_idxs), timeout_s=12.0)
@@ -500,7 +504,7 @@ class App:
                 while True:
                     ok,frame=cap.read()
                     if not ok: print("[WARN] Camera frame not available."); break
-                    if self.flip: frame=cv2.flip(frame,1)   # mirror to natural orientation
+                    if self.flip: frame=cv2.flip(frame,1)
 
                     fb=extract_features_lazy(hands_proc, frame, proc_scale=self.proc_scale)
                     finished=None
@@ -511,7 +515,7 @@ class App:
 
                     finished=self.wm.feed(fb, active=self.active)
 
-                    # If still recording dynamic, ensure missing per-frame feats are computed
+                    # If recording dynamic, ensure missing per-frame feats are computed
                     if self.wm.state==WindowState.RECORDING and self.ctx.token_mode=='dynamic':
                         for x in self.wm.buffer:
                             if x.feat_258 is None:
@@ -539,7 +543,7 @@ class App:
                                           max_width=hud.shape[1]-20, color=txt_color, scale=0.85, thickness=2, line_gap=8)
 
                     help_line=("q quit | h help | t auto/manual | a active | f flip | g font | "
-                               "1 static | 2 dynamic | m A↔N (static) | Space start/stop (manual) or commit spelled word (auto) | "
+                               "1 static | 2 dynamic | m A↔N (static) | Space start/stop (manual) or commit spelled word | "
                                "Enter accept | b back | c clear | s finalize")
                     cv2.putText(hud, help_line, (10, hud.shape[0]-12), FONT, 0.50, txt_color, 1, cv2.LINE_AA)
                     cv2.imshow("ISL Unified Inference (Gemini)", hud)
@@ -569,7 +573,7 @@ class App:
                                     finished=self.wm.buffer.copy()
                                 self.wm.reset()
                         else:
-                            # Auto: commit spelled word boundary
+                            # Auto: commit current spelled word boundary
                             self._commit_spelling_buffer(); self.ctx.final_sentence=""
                     elif key==ord('1'):
                         self.ctx.token_mode='static'
@@ -587,7 +591,6 @@ class App:
                                 self._commit_spelling_buffer(); self.ctx.tokens.append(self.ctx.last_pred)
                             self.ctx.final_sentence=""
                         else:
-                            # No "last_pred": use Enter to commit spelled buffer
                             self._commit_spelling_buffer(); self.ctx.final_sentence=""
                     elif key==ord('b'):
                         if self.ctx.spell_buf:
@@ -608,7 +611,7 @@ class App:
                             feats_258=[(x.feat_258 if x.feat_258 is not None else extract_258_from_holistic(x.frame_proc, hol)) for x in finished]
                             seq_258=np.stack(feats_258, axis=0).astype(np.float32)
                             label,conf=self.dynamic.predict(seq_258, seq_len=self.args.seq)
-                            self._commit_spelling_buffer()     # dynamic word → separate token boundary
+                            self._commit_spelling_buffer()     # dynamic word → token boundary
                             self.ctx.tokens.append(label)
                         else:
                             hands_feats=[x.hands_126 for x in finished if x.hands_126 is not None]
@@ -627,7 +630,7 @@ class App:
 
 # ======================= CLI =======================
 def parse_args()->argparse.Namespace:
-    ap=argparse.ArgumentParser(description="Unified ISL inference with Gemini-based sentence formation; no SymSpell/TTS")
+    ap=argparse.ArgumentParser(description="Unified ISL inference with Gemini sentence formation; no SymSpell/TTS")
     # camera
     ap.add_argument('--cam',type=int,default=0); ap.add_argument('--fps',type=int,default=30)
     ap.add_argument('--width',type=int,default=1280); ap.add_argument('--height',type=int,default=720)
@@ -654,7 +657,7 @@ def parse_args()->argparse.Namespace:
     # Gemini
     ap.add_argument('--use_gemini',action='store_true')
     ap.add_argument('--gemini_model',type=str,default='gemini-1.5-flash')
-    ap.add_argument('--gemini_key',type=str,default='')
+    ap.add_argument('--gemini_key',type=str,default='')  # or set GEMINI_API_KEY / GOOGLE_API_KEY
     ap.add_argument('--temperature',type=float,default=0.2)
     # start mode
     ap.add_argument('--default_dynamic',action='store_true')
