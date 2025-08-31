@@ -44,17 +44,37 @@ python dynamic/augment.py   --root dynamic/data   --subset topk --top_k 100   --
 ---
 
 ## 2) Train models
+
 ### CTR‑GCN (recommended)
+
+#### A) Train **without** bi‑hand augmentation (right‑hand view only)
+```bash
+python dynamic/train.py   --data dynamic/data/top_100/aug_keypoints   --normalize_body --use_bones --use_vel   --epochs 60 --batch 64 --amp
+```
+
+#### B) Train **with** bi‑hand augmentation (mirror left/right during training)
+Constant probability from the start:
 ```bash
 python dynamic/train.py   --data dynamic/data/top_100/aug_keypoints   --normalize_body --use_bones --use_vel   --bihand --bihand_p 0.5 --bihand_ramp_epoch 0   --epochs 60 --batch 64 --amp
 ```
-Outputs (by default):
+
+Gradual ramp‑up (introduce bi‑hand after a few warm‑up epochs):
+```bash
+python dynamic/train.py   --data dynamic/data/top_100/aug_keypoints   --normalize_body --use_bones --use_vel   --bihand --bihand_p 0.5 --bihand_ramp_epoch 10   --epochs 60 --batch 64 --amp
+```
+
+> **Notes**
+> - `--bihand` enables mirrored sampling to improve robustness for left‑handed signers.
+> - `--bihand_p` controls the probability of mirrored samples per batch (e.g., 0.5 = half of samples mirrored).
+> - `--bihand_ramp_epoch N` starts near 0 and ramps towards `--bihand_p` over the first `N` epochs (use `0` for no ramp).
+
+**Outputs (default if `--save` not given and `--data` matches a known subset):**
 ```
 dynamic/data/<subset>/ctr_gcn/
   ckpt_best.pt  ckpt_last.pt  params.json  log.csv
 ```
 
-### Alternatives
+### Alternatives (for experiments)
 - `lstm` — single‑layer LSTM → MLP
 - `bilstm_att` — BiLSTM + attention pooling
 - `relpos` — Transformer encoder with relative position bias
@@ -65,17 +85,25 @@ python dynamic/train_alt.py   --data dynamic/data/top_100/aug_keypoints   --mode
 
 ---
 
-## 3) Evaluate
+## 3) Resume training
 ```bash
-python dynamic/eval.py   --data dynamic/data/top_100/aug_keypoints   --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt
-# Prints macro‑F1/acc/loss; reads params from ckpt/params.json.
+# train.py will auto‑resume from ckpt_last.pt if present
+python dynamic/train.py --data dynamic/data/top_100/aug_keypoints --amp
 ```
 
 ---
 
-## 4) Realtime test (dynamic only)
+## 4) Evaluate
 ```bash
-python dynamic/inference.py   --data dynamic/data/top_100/aug_keypoints   --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt
+python dynamic/eval.py   --data dynamic/data/top_100/aug_keypoints   --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt
+# Prints macro‑F1/acc/loss and reads feature params from ckpt/params.json.
+```
+
+---
+
+## 5) Realtime test (dynamic only)
+```bash
+python dynamic/inference.py   --data dynamic/data/top_100/aug_keypoints   --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt 
 ```
 
 ---
@@ -83,4 +111,4 @@ python dynamic/inference.py   --data dynamic/data/top_100/aug_keypoints   --ckpt
 **Tips**
 - Set `--amp` for mixed‑precision on CUDA.
 - Use `--resume` (`train.py` auto‑resumes from `ckpt_last.pt` if present).
-- Left‑handed signers at inference: `--flip` to mirror.
+- Left‑handed signers at inference: try `--flip` to mirror.
