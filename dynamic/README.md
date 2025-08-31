@@ -80,11 +80,6 @@ python dynamic/inference.py   --data dynamic/data/top_100/aug_keypoints   --ckpt
 
 ---
 
-## Utilities
-- `debug_draw.py` — overlay pose/hand skeletons across time and export MP4s.
-- `debug_metadata.py` — check `label_to_id.json`, split sizes, and shapes.
-- `debug_frequency.py` — show class frequencies (helpful for Top‑K label selection).
-
 **Tips**
 - Set `--amp` for mixed‑precision on CUDA.
 - Use `--resume` (`train.py` auto‑resumes from `ckpt_last.pt` if present).
