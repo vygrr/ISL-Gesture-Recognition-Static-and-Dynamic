@@ -1,73 +1,116 @@
-# Indian Sign Language Recognition — Static & Dynamic Gestures
+# Indian Sign Language Recognition — Static + Dynamic (Realtime)
 
-This repository contains our final-year project on automatic recognition of Indian Sign Language (ISL).
-It includes two complementary tracks: **static** (single-frame handshapes) and **dynamic** (short sequences of full-body
-pose and hands). Both tracks rely on MediaPipe landmark extraction and train lightweight neural models that can run in
-real time on commodity hardware.
+A production‑ready ISL recognition project with two branches that work together:
 
-> Scope: Ignore `dynamic/include50/updated/` (work-in-progress). Use `static/` and `dynamic/include50/original/` for all experiments.
+- **Static** (alphabets & numerals): lightweight **MLP** over 126‑D MediaPipe hand landmarks.
+- **Dynamic** (top‑K/common words): **CTR‑GCN** and alternative sequence models over pose+hands keypoints.
+- **Unified realtime app**: `inference.py` at repo root combines static & dynamic predictions and optionally
+  uses **Gemini** to stitch tokens into short, grammatical sentences (adds only function words; no new content).
 
-## Repository layout
+> **Note:** This repo intentionally excludes heavy datasets and checkpoints. A small helper script to download the
+> dynamic keypoints/data will be added (see **Data & Downloads**).
 
+---
+
+## What’s inside
 ```
-.
-├── static/                 # Static handshape pipeline (features, training, realtime inference)
-├── dynamic/
-│   └── include50/
-│       ├── original/       # Dynamic gesture pipeline (augment/extract, training, inference)
-│       └── updated/        # WIP — not part of the evaluated pipeline
-└── (docs, configs, etc.)   # See sub-READMEs for details
+Major Project VII/
+├─ inference.py                 # Unified realtime (Static+Dynamic) + Gemini sentence formation
+├─ gemini_client.py             # Minimal client with guardrails for sentence formation
+├─ dynamic/
+│  ├─ augment.py                # Split → augment → keypoints (pose+hands) with RESUME/verify
+│  ├─ train.py                  # CTR‑GCN training (normalize_body/use_bones/use_vel, bi-hand options)
+│  ├─ train_alt.py              # LSTM / BiLSTM+Attention / RelPos Transformer training
+│  ├─ eval.py                   # Evaluate on val/test; strict ckpt params; macro‑F1/acc/loss
+│  ├─ inference.py              # Realtime tester for trained dynamic models
+│  ├─ debug_draw.py             # Visualize/annotate sequences, export MP4s
+│  ├─ debug_metadata.py         # Inspect dataset stats, label maps, splits
+│  └─ debug_frequency.py        # Class‑frequency helper for Top‑K selection
+└─ static/
+   ├─ load.py                   # Build 126‑D features (MP Hands) → alphabets/numerals .npz
+   ├─ train.py                  # Train MLPs and save encoders/models
+   ├─ inference.py              # Webcam inference for static only
+   ├─ accuracy.py               # Quick test‑set accuracy & report
+   └─ collage.py                # Dataset collage utilities
 ```
 
-## Quick start
+---
 
-1. **Create a Python 3.10 environment.**
-2. Install requirements *per track*:
-   ```bash
-   # Static gestures
-   pip install -r static/requirements.txt
-   # Dynamic gestures
-   pip install -r dynamic/requirements.txt
-   ```
-   > GPU users: install the correct PyTorch wheel for your CUDA version (e.g., `--index-url https://download.pytorch.org/whl/cu121`).
+## Environment
+- Python **3.10+**
+- GPU optional but recommended for dynamic training/inference
+- Suggested packages (install via pip):
+  ```bash
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  pip install mediapipe opencv-python numpy pandas scikit-learn tqdm joblib requests wordfreq
+  ```
 
-3. Follow the **`static/README.md`** and **`dynamic/README.md`** for data preparation, training, and inference.
+> Exact versions aren’t hard‑pinned here. For deterministic runs, create a virtualenv and freeze with `pip freeze > requirements.txt` once working.
 
-### Environment notes
+---
 
-- Tested on Windows 10/11 and Python 3.10.
-- MediaPipe 0.10.x requires **`numpy<2`**. OpenCV version is pinned for camera backend stability on Windows (MSMF).
-- Paths in examples use Windows drive letters; all scripts also accept POSIX paths.
+## Data & Downloads (important)
+This repo does **not** include dynamic data (raw videos or extracted keypoints) or large checkpoints.
 
-## Data & versioning policy
+- **Dynamic keypoints (to be added):** In the next update, a helper script (e.g. `tools/download_dynamic_data.py`) will download the
+  prepared **augmented keypoints** and example **CTR‑GCN checkpoints** for quick testing. The README in `dynamic/` already documents
+  the expected directory layout so you can prepare them yourself if preferred.
+- **Static data:** You can generate the 126‑D `.npz` feature files using `static/load.py` from your labeled images.
 
-- **`static/data/` is tracked in Git.** It is small enough to keep under version control (encoders, small `.npz` files,
-  and example checkpoints). These files enable out‑of‑the‑box reproduction of the static pipeline.
-- **Dynamic data and artifacts are *not* tracked.** The dynamic pipeline generates >100 MB of feature arrays and
-  checkpoints; those are excluded via `.gitignore`. Scripts recreate everything deterministically from raw videos.
+---
 
-Where possible, include a **tiny sample** (a few clips or a synthetic mini‑set) for CI/smoke tests without distributing the
-full dataset. The dynamic README documents the expected folder layout.
+## Quickstart
 
-## Method overview
+### 1) Static (alphabets & numerals)
+```bash
+# Train
+python static/train.py
 
-- **Static track**: single-frame classification using hand landmarks (one or both hands). We compute normalized
-  coordinates and train a small MLP. The model targets **alphabets** and **numerals**; a toggle in the
-  inference script selects the active label set.
-- **Dynamic track**: sequence classification using MediaPipe Holistic (pose + both hands). We construct fixed-length
-  sequences (padding/trim) and train a BiLSTM-based classifier (optionally with attention).
+# Run webcam demo
+python static/inference.py
+# Expected files:
+#   static/data/model/{alphabets.pth,numerals.pth}
+#   static/data/encoder/{alphabets.pkl,numerals.pkl}
+```
 
-## Reproducibility
+### 2) Dynamic (words)
+Prepare augmented keypoints and train/evaluate models — see full details in **dynamic/README.md**.
+```bash
+# Example: Realtime test of a trained CTR‑GCN
+python dynamic/inference.py   --data dynamic/data/top_100/aug_keypoints   --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt   --live_draw
+```
 
-- Each training script accepts a `--seed` flag to fix initialization and data shuffling.
-- Model checkpoints and encoders are written to dedicated subfolders (see per-track READMEs).
-- We keep all preprocessing steps in script form to enable end-to-end reruns on fresh machines.
+### 3) Unified realtime (static+dynamic + Gemini)
+```bash
+# Default looks for dynamic assets in dynamic/data/top_100/{aug_keypoints,ctr_gcn}
+python inference.py --use_gemini --gemini_key $GEMINI_API_KEY
+# Tips:
+#   --mode {auto,manual}   windowing
+#   --flip/--no-flip       mirror for left/right dominant signers
+#   --default_dynamic      start in dynamic mode (else static)
+```
 
-## Team
+---
 
-- Member 1 — Dheeraj Devadas 
-- Member 2 — Ayush Duduskar
-- Member 3 — Aditya Gupta
-- Member 4 — Gaurav Patil
+## Folder conventions (dynamic)
+The dynamic pipeline expects this shape **after** augmentation:
+```
+dynamic/data/<subset>/
+├─ aug_keypoints/
+│  ├─ label_to_id.json
+│  ├─ index_train.csv, index_val.csv, [index_test.csv]
+│  ├─ train/<label_id>/*.npz
+│  └─ val/<label_id>/*.npz
+└─ ctr_gcn/
+   ├─ ckpt_best.pt, ckpt_last.pt, params.json, log.csv
+   └─ ... (other runs allowed)
+```
+`<subset>` is typically `include_50`, `include` (full), or `top_<K>` (e.g., `top_100`).
 
+---
 
+## Troubleshooting
+- **MediaPipe errors on Windows:** install `mediapipe` prebuilt wheels and ensure a modern GPU driver.
+- **OpenCV high CPU usage:** the code sets low thread counts; ensure other apps aren’t grabbing the camera.
+- **Model mismatch:** `eval.py` and `dynamic/inference.py` strictly read `params.json` or `ckpt['params']` to rebuild the feature config.
+- **Left‑handed users:** prefer `--flip` at inference (the CTR‑GCN was trained on right‑handers by default).

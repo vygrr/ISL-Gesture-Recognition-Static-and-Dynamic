@@ -1,78 +1,80 @@
-# Dynamic Gestures (INCLUDE-50)
+# Dynamic Module (Words) — CTR‑GCN & Alternatives
 
-Dynamic gestures are recognized from **short video sequences** using MediaPipe Holistic to obtain pose and hand
-landmarks per frame. We prepare fixed-length sequences and train a BiLSTM-based classifier (optionally with attention).
-All scripts used in our experiments are under `dynamic/include50/original/`.
+This module handles **dynamic sign recognition** from short pose+hands sequences.
+End‑to‑end flow: **split CSVs → augmentation → keypoints → training → evaluation → realtime**.
 
-> The directory `dynamic/include50/updated/` is a work-in-progress branch and is **not** part of the evaluated pipeline.
+---
 
-## Directory structure
+## 1) Augmentation → keypoints
+`augment.py` reads your INCLUDE split CSVs + raw videos, crops and trims each clip, and writes compact keypoint tensors.
+It is **resume‑safe**, can verify/repair existing `.npz`, and auto‑selects output directories based on `--subset`.
 
+**Inputs (expected under `--root`, default: `dynamic/data`)**
 ```
-dynamic/include50/
-├── original/
-│   ├── augment.py      # Optional: crop/pad frames, basic augmentation, write landmarks
-│   ├── train.py        # Train BiLSTM classifier
-│   ├── inference.py    # One-shot realtime/interactive inference
-│   └── debug_*.py      # Diagnostics and visualization utilities
-└── updated/            # WIP (ignored)
+include_train.csv
+include_val.csv
+[include_test.csv]
+raw_videos/...   # path patterns inside the CSVs
 ```
 
-## Installation
+**Outputs (auto‑selected unless `--out` is given)**
+```
+dynamic/data/include_50/aug_keypoints/
+dynamic/data/include/aug_keypoints/
+dynamic/data/top_<K>/aug_keypoints/
+  ├─ label_to_id.json
+  ├─ index_{train,val,test}.csv
+  ├─ train/<label_id>/*.npz
+  └─ val/<label_id>/*.npz
+```
+
+**Example**
+```bash
+# Top‑100 setup with gentle idle‑trim and 4 workers
+python dynamic/augment.py \
+  --root dynamic/data \
+  --subset topk --top_k 100 \
+  --trim_idle --workers 4
+```
+
+---
+
+## 2) Train models
+### CTR‑GCN (recommended)
+```bash
+python dynamic/train.py \  --data dynamic/data/top_100/aug_keypoints \  --normalize_body --use_bones --use_vel \  --bihand --bihand_p 0.5 --bihand_ramp_epoch 0 \  --epochs 60 --batch 64 --amp
+```
+If `--save` is not provided and `--data` matches one of the known subsets, outputs go to:
+```
+dynamic/data/<subset>/ctr_gcn/
+  ckpt_best.pt  ckpt_last.pt  params.json  log.csv
+```
+
+### Alternatives (for experiments)
+- `lstm` — single‑layer LSTM → MLP
+- `bilstm_att` — BiLSTM + additive attention pooling
+- `relpos` — Transformer encoder with relative position bias
 
 ```bash
-pip install -r dynamic/requirements.txt
+python dynamic/train_alt.py \  --data dynamic/data/top_100/aug_keypoints \  --model relpos --epochs 60 --batch 64 --amp
 ```
 
-- Python 3.10 recommended.
-- MediaPipe 0.10.x with `numpy<2`.
-- PyTorch (CPU or CUDA; install the wheel matching your CUDA version if using GPU).
+---
 
-## Data policy
-
-The **dynamic data footprint exceeds 100 MB**, so it is **excluded from the repository** via `.gitignore`.
-This includes raw videos, extracted keypoints, large `.npz`/`.npy` arrays, checkpoints, and training runs.
-Use the commands below to regenerate artifacts locally.
-
-If you need reproducible, shareable artifacts without committing them, consider
-- releasing checkpoints as GitHub **release assets**, or
-- using an external storage backend (e.g., DVC, cloud object storage).
-
-## Data preparation
-
-1. **Augment/crop (optional) and extract landmarks**
-   ```bash
-   python dynamic/include50/original/augment.py      --root "D:/INCLUDE"      --out  "D:/INCLUDE_KEYPOINTS"      --left 10 --right 10 --top 0      --workers 4
-   ```
-   - Reads raw INCLUDE-50 videos from `--root` and writes processed keypoints under `--out`.
-   - Basic cropping margins (`--left/--right/--top`) help center the signer for seated-use cases.
-   - Parallelism via `--workers`.
-
-2. **Sequence construction**
-   - Landmarks from pose and both hands are concatenated per frame, normalized, and sampled to a fixed length `T`
-     (default 200). Short clips are padded; long clips are trimmed.
-
-## Training
-
+## 3) Evaluate
 ```bash
-python dynamic/include50/original/train.py   --data "D:/INCLUDE_KEYPOINTS"   --save "D:/RUNS_BiLSTM"   --epochs 120 --batch 32 --lr 1e-3   --workers 2 --seed 42 --amp
+python dynamic/eval.py \  --data dynamic/data/top_100/aug_keypoints \  --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt
+# Prints macro‑F1/acc/loss, reads params from ckpt/params.json.
 ```
-- Saves checkpoints, logs, and label encoders under `--save`.
-- `--amp` enables mixed precision when a suitable GPU is available.
 
-## Inference (camera)
+---
 
+## 4) Realtime test (dynamic only)
 ```bash
-python dynamic/include50/original/inference.py   --ckpt "D:/RUNS_BiLSTM/best.ckpt"   --width 1280 --height 720   --hol_complex 2   --hands_fallback
+python dynamic/inference.py \  --data dynamic/data/top_100/aug_keypoints \  --ckpt dynamic/data/top_100/ctr_gcn/ckpt_best.pt
 ```
 
-- **Windows camera backends**: the scripts default to MSMF. If a virtual camera (e.g., OBS or Camo) is not detected:
-  - Ensure the virtual camera driver is installed.
-  - Try `CAP_DSHOW` as a fallback and verify the device index.
-  - If the feed appears only after opening another camera once, insert a short warm-up grab loop before reading frames.
-  - Avoid “exclusive control” in other apps.
-
-## Reproducibility
-
-- Use `--seed` to fix all RNG sources where supported.
-- Keep feature extraction parameters and sequence length consistent between training and inference.
+**Tips**
+- Set `--amp` for mixed‑precision on CUDA.
+- Use `--resume` (`train.py` auto‑resumes from `ckpt_last.pt` if present).
+- For left‑handed signers at inference, try `--flip` (mirrors the view).

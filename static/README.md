@@ -1,68 +1,41 @@
-# Static Gestures
+# Static Module (Alphabets & Numerals) — MLP over 126‑D Hands
 
-Static gestures are recognized from **single frames** using hand landmarks. The pipeline extracts normalized features,
-trains a compact MLP classifier, and offers a realtime inference script with camera support on Windows (MSMF backend).
+This module performs **frame‑level** classification for alphabets and numerals using MediaPipe Hands landmarks.
 
-## Directory structure
+---
 
+## 1) Build features
+`load.py` crawls your labeled image folders, extracts **Left+Right hand** landmarks (63+63=126), and writes:
 ```
-static/
-├── data/
-│   ├── encoder/     # Label encoders (saved during training)
-│   ├── load/        # Preprocessed feature files (.npz)
-│   └── model/       # Trained weights/checkpoints
-├── load.py          # Build dataset (.npz) from raw landmarks/images
-├── train.py         # Train MLP classifier
-├── inference.py     # Realtime webcam inference (toggle alphabets/numerals)
-├── debug.py         # Utilities/visualization
-└── accuracy.py      # Evaluation helpers
+static/data/load/alphabets_data.npz
+static/data/load/numerals_data.npz
 ```
 
-## Installation
-
+Run:
 ```bash
-pip install -r static/requirements.txt
+python static/load.py --root /path/to/your/static_dataset_root
 ```
 
-- Python 3.10 recommended.
-- `mediapipe==0.10.21` with `numpy<2`.
-- `opencv-python==4.11.0.86` for stable MSMF backend on Windows.
+---
 
-## Data policy
-
-The **`static/data/` directory is tracked in Git**. It contains small artifacts such as:
-- `.npz` feature files for quick starts,
-- trained checkpoints for reference,
-- `encoder` objects used by inference.
-
-You can always regenerate these artifacts using the commands below if you prefer a clean run.
-
-## Data preparation
-
+## 2) Train
 ```bash
-python static/load.py --data_dir "PATH_TO_RAW" --out static/data/load
-```
-- Output: `.npz` files in `static/data/load/`.
-- Labels: **Alphabets** and **Numerals** are maintained as separate label sets.
-  Some alphabet classes are single-hand (e.g., C, I, L, O, U, V); others use two hands.
-
-## Training
-
-```bash
-python static/train.py   --data static/data/load   --save_model static/data/model   --save_encoder static/data/encoder   --epochs 300 --batch 64 --lr 1e-3 --seed 42
+python static/train.py
+# Saves:
+#   static/data/model/{alphabets.pth,numerals.pth}
+#   static/data/encoder/{alphabets.pkl,numerals.pkl}
 ```
 
-Artifacts:
-- **Weights** → `static/data/model/`
-- **Label encoders** → `static/data/encoder/`
+Use `accuracy.py` to quickly verify test accuracy and a classification report.
 
-## Realtime inference
+---
 
+## 3) Webcam inference (static only)
 ```bash
 python static/inference.py
+# Press 'm' to toggle Alphabet ↔ Numeral; 'q' to quit
 ```
 
-During inference:
-- Press **`m`** to switch between **alphabets** and **numerals**.
-- Camera tips (Windows): the script uses MSMF. If the webcam does not initialize, retry with the default camera once,
-  then switch index; or try `cv2.CAP_DSHOW` as a fallback.
+**Notes**
+- Some alphabets are single‑hand only (e.g., C, I, L, O, U, V); numerals require one hand.
+- The training script applies horizontal‑flip augmentation so either hand can be recognized.
